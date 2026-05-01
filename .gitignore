@@ -55,3 +55,8 @@ _ReSharper*/
 
 # Ignore generated verification and export CSVs
 *.csv
+
+software_history.md
+software_intent.md
+software_tests.md
+*.bak

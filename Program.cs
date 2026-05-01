@@ -9,6 +9,9 @@ namespace FastFileHasher;
 public class Program
 {
     const int DEFAULT_BATCH_SIZE = 5000;
+    const int ROBOCOPY_FILE_BATCH_SIZE = 200;
+    const long ROBOCOPY_TARGET_BATCH_BYTES = 1L << 30; // 1 GiB
+    const int STALE_BATCH_SECONDS = 1800;
 
     public static void Main(string[] args)
     {
@@ -63,9 +66,7 @@ public class Program
             RunScan(root, dbPath, phase, threads, inMemory);
 
             if (mode == "verify")
-            {
                 RunVerifyReport(root, dbPath, phase);
-            }
         }
         else if (mode == "copy" || mode == "migrate")
         {
@@ -157,12 +158,19 @@ public class Program
         // Initialize schema synchronously so the scanner and workers can immediately see tables.
         InitSchema(dbPath);
 
-        // Reset any stale COPYING states left by a previous crash.
+        // Reset stale COPYING states left by a previous crash/abrupt stop.
         using (var rc = new SqliteConnection($"Data Source={dbPath}"))
         {
             rc.Open();
             using var c = rc.CreateCommand();
-            c.CommandText = "UPDATE file_copy SET state='PENDING' WHERE state='COPYING'";
+            c.CommandText = """
+                UPDATE file_copy
+                SET state='PENDING', batch_id=NULL, batch_claimed_at=NULL, updated_at=$t
+                WHERE state='COPYING' AND (batch_claimed_at IS NULL OR batch_claimed_at < $staleBefore)
+            """;
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            c.Parameters.AddWithValue("$t", now);
+            c.Parameters.AddWithValue("$staleBefore", now - STALE_BATCH_SECONDS);
             c.ExecuteNonQuery();
         }
 
@@ -180,25 +188,22 @@ public class Program
         var scannerTask = Task.Run(() =>
         {
             // Recover any PENDING files from a previous interrupted run first.
-            List<CopyJob> resumeJobs = new();
+            int resumePending = 0;
             using (var rc = new SqliteConnection($"Data Source={dbPath}"))
             {
                 rc.Open();
                 using var cmd = rc.CreateCommand();
-                cmd.CommandText = @"
-                    SELECT fc.src_path, fc.dest_path, h.sha256
-                    FROM file_copy fc
-                    JOIN file_hashes h ON fc.src_path = h.path AND h.phase = $ph
-                    WHERE fc.state = 'PENDING'";
-                cmd.Parameters.AddWithValue("$ph", srcPhase);
-                using var rdr = cmd.ExecuteReader();
-                while (rdr.Read())
-                    resumeJobs.Add(new CopyJob(rdr.GetString(0), rdr.GetString(1), rdr.GetString(2)));
+                cmd.CommandText = "SELECT COUNT(*) FROM file_copy WHERE state='PENDING'";
+                resumePending = Convert.ToInt32(cmd.ExecuteScalar() ?? 0);
             }
-            foreach (var j in resumeJobs)
-                copyQueue.Add(j);
-            if (resumeJobs.Count > 0)
-                Console.WriteLine($"Resuming {resumeJobs.Count} pending file(s) from previous run.");
+            if (!useRobocopy)
+            {
+                List<CopyJob> resumeJobs = LoadPendingCopyJobs(dbPath, srcPhase);
+                foreach (var j in resumeJobs)
+                    copyQueue.Add(j);
+            }
+            if (resumePending > 0)
+                Console.WriteLine($"Resuming {resumePending} pending file(s) from previous run.");
 
             // Also recover any COPIED-but-not-verified files.
             List<VerifyJob> resumeVerify = new();
@@ -220,7 +225,7 @@ public class Program
                 verifyQueue.Add(j);
 
             // Now enumerate + hash new source files.
-            var alreadyKnown = new HashSet<string>(resumeJobs.Select(j => j.SrcPath));
+            var alreadyKnown = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             using (var rc = new SqliteConnection($"Data Source={dbPath}"))
             {
                 rc.Open();
@@ -246,7 +251,8 @@ public class Program
                         {
                             string destP = NormalizePath(Path.Combine(destRoot, folder, filename));
                             dbOps.Add(new CopyInsert(file, destP));
-                            copyQueue.Add(new CopyJob(file, destP, hash));
+                            if (!useRobocopy)
+                                copyQueue.Add(new CopyJob(file, destP, hash, size));
                         }
                     }
                     catch (Exception ex)
@@ -258,52 +264,44 @@ public class Program
                     }
                 });
 
-            copyQueue.CompleteAdding();
+            if (!useRobocopy)
+                copyQueue.CompleteAdding();
             Console.WriteLine("Scanner complete.");
         });
 
-        // ── Copy Workers ─────────────────────────────────────────────────────
-        var copyWorkers = Enumerable.Range(0, threads).Select(_ => Task.Run(() =>
+        Task[] copyWorkers;
+        if (useRobocopy)
         {
-            foreach (var job in copyQueue.GetConsumingEnumerable())
+            copyWorkers = new[] { Task.Run(() =>
             {
-                dbOps.Add(new CopyStateUpdate(job.SrcPath, "COPYING", ""));
-                try
+                scannerTask.Wait();
+                RunRobocopyBatches(dbPath, srcPhase, threads, dbOps, verifyQueue);
+            }) };
+        }
+        else
+        {
+            copyWorkers = Enumerable.Range(0, threads).Select(_ => Task.Run(() =>
+            {
+                foreach (var job in copyQueue.GetConsumingEnumerable())
                 {
-                    if (useRobocopy)
-                    {
-                        string sDir = StripExtendedPrefix(Path.GetDirectoryName(job.SrcPath)!);
-                        string dDir = StripExtendedPrefix(Path.GetDirectoryName(job.DestPath)!);
-                        string fname = Path.GetFileName(job.SrcPath);
-                        Directory.CreateDirectory(dDir);
-                        var psi = new ProcessStartInfo
-                        {
-                            FileName = "robocopy",
-                            Arguments = $"\"{sDir}\" \"{dDir}\" \"{fname}\" /Z /B /COPYALL /R:1 /W:1 /MT:{threads} /NFL /NDL /NJH /NJS",
-                            CreateNoWindow = true,
-                            UseShellExecute = false
-                        };
-                        using var proc = Process.Start(psi);
-                        if (proc != null) { proc.WaitForExit(); if (proc.ExitCode >= 8) throw new Exception($"Robocopy exit code {proc.ExitCode}"); }
-                    }
-                    else
+                    dbOps.Add(new CopyStateUpdate(job.SrcPath, "COPYING", ""));
+                    try
                     {
                         string destDir = Path.GetDirectoryName(job.DestPath)!;
                         Directory.CreateDirectory(destDir);
-                        // Random GUID temp name guarantees no collision with any existing file
                         string tempDest = Path.Combine(destDir, Guid.NewGuid().ToString("N") + ".tmp");
                         File.Copy(job.SrcPath, tempDest, overwrite: false);
                         File.Move(tempDest, job.DestPath, overwrite: true);
+                        dbOps.Add(new CopyStateUpdate(job.SrcPath, "COPIED", ""));
+                        verifyQueue.Add(new VerifyJob(job.SrcPath, job.DestPath, job.SrcSha256));
                     }
-                    dbOps.Add(new CopyStateUpdate(job.SrcPath, "COPIED", ""));
-                    verifyQueue.Add(new VerifyJob(job.SrcPath, job.DestPath, job.SrcSha256));
+                    catch (Exception ex)
+                    {
+                        dbOps.Add(new CopyStateUpdate(job.SrcPath, "FAILED", ex.Message));
+                    }
                 }
-                catch (Exception ex)
-                {
-                    dbOps.Add(new CopyStateUpdate(job.SrcPath, "FAILED", ex.Message));
-                }
-            }
-        })).ToArray();
+            })).ToArray();
+        }
 
         // ── Verify Workers ───────────────────────────────────────────────────
         var verifyWorkers = Enumerable.Range(0, threads).Select(_ => Task.Run(() =>
@@ -318,7 +316,7 @@ public class Program
 
                     if (destHash == job.SrcSha256)
                     {
-                        dbOps.Add(new CopyStateUpdate(job.SrcPath, "VERIFIED", ""));
+                        dbOps.Add(new CopyVerified(job.SrcPath));
                         if (isMigrate) try { File.Delete(job.SrcPath); } catch { }
                     }
                     else
@@ -332,7 +330,7 @@ public class Program
         })).ToArray();
 
         // Wait for all stages to complete in pipeline order.
-        scannerTask.Wait();          // scanner completes and closes copyQueue
+        scannerTask.Wait();
         Task.WaitAll(copyWorkers);   // all copies done
         verifyQueue.CompleteAdding();
         Task.WaitAll(verifyWorkers); // all verifications done
@@ -340,7 +338,31 @@ public class Program
         writerTask.Wait();           // all DB writes flushed
 
         Console.WriteLine("Engine run complete. Generating Verification Report...");
-        RunVerifyReport(destRoot, dbPath, destPhase, srcPhase);
+        int issues = RunVerifyReport(destRoot, dbPath, destPhase, srcPhase);
+
+        using (var cc = new SqliteConnection($"Data Source={dbPath}"))
+        {
+            cc.Open();
+            using var cmd = cc.CreateCommand();
+            cmd.CommandText = """
+                SELECT
+                    SUM(CASE WHEN state IN ('PENDING','COPYING') THEN 1 ELSE 0 END) AS active_count,
+                    SUM(CASE WHEN state = 'FAILED' THEN 1 ELSE 0 END) AS failed_count,
+                    SUM(CASE WHEN state = 'COPIED' AND verified_at IS NULL THEN 1 ELSE 0 END) AS unverified_count
+                FROM file_copy
+            """;
+            using var rdr = cmd.ExecuteReader();
+            rdr.Read();
+            long active = rdr.IsDBNull(0) ? 0 : rdr.GetInt64(0);
+            long failed = rdr.IsDBNull(1) ? 0 : rdr.GetInt64(1);
+            long unverified = rdr.IsDBNull(2) ? 0 : rdr.GetInt64(2);
+
+            if (active > 0 || failed > 0 || unverified > 0 || issues > 0)
+            {
+                Console.Error.WriteLine($"Migration incomplete. Active={active}, Failed={failed}, Unverified={unverified}, VerificationIssues={issues}");
+                Environment.ExitCode = 1;
+            }
+        }
     }
 
     // Initialises the DB schema synchronously. Safe to call multiple times (IF NOT EXISTS).
@@ -369,14 +391,106 @@ public class Program
             CREATE INDEX IF NOT EXISTS idx_folder_phase ON file_hashes(folder, phase);
 
             CREATE TABLE IF NOT EXISTS file_copy (
-                src_path   TEXT PRIMARY KEY,
-                dest_path  TEXT NOT NULL,
-                state      TEXT NOT NULL,
-                last_error TEXT,
-                updated_at INTEGER NOT NULL
+                path        TEXT PRIMARY KEY,
+                src_path    TEXT NOT NULL,
+                dest_path   TEXT NOT NULL,
+                state       TEXT NOT NULL,
+                last_error  TEXT,
+                updated_at  INTEGER NOT NULL,
+                verified_at INTEGER,
+                batch_id TEXT,
+                batch_claimed_at INTEGER,
+                batch_attempt INTEGER NOT NULL DEFAULT 0
             );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_file_copy_src_path ON file_copy(src_path);
+            CREATE INDEX IF NOT EXISTS idx_file_copy_state ON file_copy(state);
+            CREATE INDEX IF NOT EXISTS idx_file_copy_batch_id ON file_copy(batch_id);
         """;
         cmd.ExecuteNonQuery();
+
+        EnsureFileCopySchema(conn);
+    }
+
+    static void EnsureFileCopySchema(SqliteConnection conn)
+    {
+        var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string pkColumn = "";
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA table_info(file_copy)";
+            using var rdr = cmd.ExecuteReader();
+            while (rdr.Read())
+            {
+                string name = rdr.GetString(1);
+                columns.Add(name);
+                int pk = rdr.GetInt32(5);
+                if (pk == 1)
+                    pkColumn = name;
+            }
+        }
+
+        bool needsMigration =
+            !columns.Contains("path") ||
+            !columns.Contains("src_path") ||
+            !columns.Contains("dest_path") ||
+            !columns.Contains("state") ||
+            !columns.Contains("last_error") ||
+            !columns.Contains("updated_at") ||
+            !columns.Contains("verified_at") ||
+            !columns.Contains("batch_id") ||
+            !columns.Contains("batch_claimed_at") ||
+            !columns.Contains("batch_attempt") ||
+            !pkColumn.Equals("path", StringComparison.OrdinalIgnoreCase);
+
+        if (!needsMigration)
+            return;
+
+        string pathExpr = columns.Contains("path") ? "path" : "src_path";
+        string srcPathExpr = columns.Contains("src_path") ? "src_path" : "path";
+        string verifiedAtExpr = columns.Contains("verified_at") ? "verified_at" : "NULL";
+        string batchIdExpr = columns.Contains("batch_id") ? "batch_id" : "NULL";
+        string batchClaimedExpr = columns.Contains("batch_claimed_at") ? "batch_claimed_at" : "NULL";
+        string batchAttemptExpr = columns.Contains("batch_attempt") ? "batch_attempt" : "0";
+
+        using var tx = conn.BeginTransaction();
+        using var migrateCmd = conn.CreateCommand();
+        migrateCmd.Transaction = tx;
+        migrateCmd.CommandText = $"""
+            CREATE TABLE file_copy_new (
+                path        TEXT PRIMARY KEY,
+                src_path    TEXT NOT NULL,
+                dest_path   TEXT NOT NULL,
+                state       TEXT NOT NULL,
+                last_error  TEXT,
+                updated_at  INTEGER NOT NULL,
+                verified_at INTEGER,
+                batch_id TEXT,
+                batch_claimed_at INTEGER,
+                batch_attempt INTEGER NOT NULL DEFAULT 0
+            );
+
+            INSERT INTO file_copy_new(path, src_path, dest_path, state, last_error, updated_at, verified_at, batch_id, batch_claimed_at, batch_attempt)
+            SELECT
+                {pathExpr},
+                {srcPathExpr},
+                dest_path,
+                state,
+                last_error,
+                updated_at,
+                {verifiedAtExpr},
+                {batchIdExpr},
+                {batchClaimedExpr},
+                {batchAttemptExpr}
+            FROM file_copy;
+
+            DROP TABLE file_copy;
+            ALTER TABLE file_copy_new RENAME TO file_copy;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_file_copy_src_path ON file_copy(src_path);
+            CREATE INDEX IF NOT EXISTS idx_file_copy_state ON file_copy(state);
+            CREATE INDEX IF NOT EXISTS idx_file_copy_batch_id ON file_copy(batch_id);
+        """;
+        migrateCmd.ExecuteNonQuery();
+        tx.Commit();
     }
 
     static int DbWriter(BlockingCollection<object> queue, string dbPath, bool inMemory)
@@ -415,13 +529,28 @@ public class Program
         var cmdInsertCopy = workConn.CreateCommand();
         cmdInsertCopy.CommandText = """
             INSERT OR IGNORE INTO file_copy
-            (src_path, dest_path, state, updated_at)
-            VALUES ($sp,$dp,'PENDING',$t)
+            (path, src_path, dest_path, state, updated_at, verified_at, batch_id, batch_claimed_at, batch_attempt)
+            VALUES ($p,$sp,$dp,'PENDING',$t,NULL,NULL,NULL,0)
         """;
 
         var cmdUpdateCopy = workConn.CreateCommand();
         cmdUpdateCopy.CommandText = """
-            UPDATE file_copy SET state=$st, last_error=$err, updated_at=$t WHERE src_path=$sp
+            UPDATE file_copy
+            SET
+                state=$st,
+                last_error=$err,
+                updated_at=$t,
+                verified_at=CASE WHEN $st='COPIED' THEN NULL ELSE verified_at END,
+                batch_id=CASE WHEN $st IN ('COPIED','FAILED') THEN NULL ELSE batch_id END,
+                batch_claimed_at=CASE WHEN $st IN ('COPIED','FAILED') THEN NULL ELSE batch_claimed_at END
+            WHERE src_path=$sp
+        """;
+
+        var cmdMarkVerified = workConn.CreateCommand();
+        cmdMarkVerified.CommandText = """
+            UPDATE file_copy
+            SET verified_at=$t, last_error=NULL, updated_at=$t
+            WHERE src_path=$sp
         """;
 
         int count = 0;
@@ -448,6 +577,7 @@ public class Program
                     else if (msg is CopyInsert ci)
                     {
                         cmdInsertCopy.Parameters.Clear();
+                        cmdInsertCopy.Parameters.AddWithValue("$p", ci.SrcPath);
                         cmdInsertCopy.Parameters.AddWithValue("$sp", ci.SrcPath);
                         cmdInsertCopy.Parameters.AddWithValue("$dp", ci.DestPath);
                         cmdInsertCopy.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
@@ -462,6 +592,13 @@ public class Program
                         cmdUpdateCopy.Parameters.AddWithValue("$sp", cu.SrcPath);
                         cmdUpdateCopy.ExecuteNonQuery();
                     }
+                    else if (msg is CopyVerified cv)
+                    {
+                        cmdMarkVerified.Parameters.Clear();
+                        cmdMarkVerified.Parameters.AddWithValue("$sp", cv.SrcPath);
+                        cmdMarkVerified.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+                        cmdMarkVerified.ExecuteNonQuery();
+                    }
 
                     count++;
                     if (count % DEFAULT_BATCH_SIZE == 0)
@@ -472,6 +609,7 @@ public class Program
                         cmdHash.Transaction = tx;
                         cmdInsertCopy.Transaction = tx;
                         cmdUpdateCopy.Transaction = tx;
+                        cmdMarkVerified.Transaction = tx;
                     }
                 }
                 else
@@ -488,6 +626,7 @@ public class Program
                         cmdHash.Transaction = tx;
                         cmdInsertCopy.Transaction = tx;
                         cmdUpdateCopy.Transaction = tx;
+                        cmdMarkVerified.Transaction = tx;
                         count = 0;
                     }
                 }
@@ -675,7 +814,7 @@ public class Program
             : v;
     }
 
-    static void RunVerifyReport(string destRoot, string dbPath, string destPhase, string? knownSrcPhase = null)
+    static int RunVerifyReport(string destRoot, string dbPath, string destPhase, string? knownSrcPhase = null)
     {
         using var conn = new SqliteConnection($"Data Source={dbPath}");
         conn.Open();
@@ -694,7 +833,7 @@ public class Program
             if (srcObj == null || srcObj is DBNull)
             {
                 Console.WriteLine("No source phase found in DB to compare against.");
-                return;
+                return 0;
             }
             srcPhase = (string)srcObj;
         }
@@ -709,33 +848,23 @@ public class Program
             using var cmd = conn.CreateCommand();
             cmd.CommandText = """
                 SELECT 
-                    s.path AS reported_path,
+                    fc.src_path AS reported_path,
                     s.sha256 AS src_hash,
                     d.sha256 AS dst_hash,
-                    c.last_error
-                FROM file_hashes s
-                LEFT JOIN file_hashes d
-                    ON  d.folder   = s.folder
-                    AND d.filename = s.filename
-                    AND d.phase    = $dst
-                LEFT JOIN file_copy c ON c.src_path = s.path
-                WHERE s.phase = $src 
-                  AND (d.sha256 IS NULL OR s.sha256 != d.sha256 OR c.state = 'FAILED')
-
-                UNION ALL
-
-                SELECT 
-                    d.path AS reported_path,
-                    NULL AS src_hash,
-                    d.sha256 AS dst_hash,
-                    NULL AS last_error
-                FROM file_hashes d
+                    fc.last_error,
+                    fc.state,
+                    fc.verified_at
+                FROM file_copy fc
                 LEFT JOIN file_hashes s
-                    ON  s.folder   = d.folder
-                    AND s.filename = d.filename
-                    AND s.phase    = $src
-                WHERE d.phase = $dst
-                  AND s.path IS NULL
+                    ON s.path = fc.src_path AND s.phase = $src
+                LEFT JOIN file_hashes d
+                    ON d.path = fc.dest_path AND d.phase = $dst
+                WHERE
+                    s.sha256 IS NULL
+                    OR d.sha256 IS NULL
+                    OR s.sha256 != d.sha256
+                    OR fc.state = 'FAILED'
+                    OR fc.verified_at IS NULL
             """;
             cmd.Parameters.AddWithValue("$src", srcPhase);
             cmd.Parameters.AddWithValue("$dst", destPhase);
@@ -748,9 +877,13 @@ public class Program
                 string srcHash = rdr.IsDBNull(1) ? "" : rdr.GetString(1);
                 string dstHash = rdr.IsDBNull(2) ? "" : rdr.GetString(2);
                 string lastErr = rdr.IsDBNull(3) ? "" : rdr.GetString(3);
+                string state = rdr.IsDBNull(4) ? "" : rdr.GetString(4);
+                bool verified = !rdr.IsDBNull(5);
 
                 string status;
                 if (!string.IsNullOrEmpty(lastErr)) status = $"FAILED: {lastErr}";
+                else if (state == "FAILED") status = "FAILED";
+                else if (!verified) status = "UNVERIFIED";
                 else if (string.IsNullOrEmpty(srcHash)) status = "EXTRA";
                 else if (string.IsNullOrEmpty(dstHash)) status = "MISSING";
                 else status = "MISMATCH";
@@ -768,6 +901,7 @@ public class Program
         {
             Console.WriteLine($"Verification complete. Found {issues} issues. Report saved to {outCsv}");
         }
+        return issues;
     }
 
     static void RunWarmup(string dbPath)
@@ -812,10 +946,173 @@ public class Program
 
         Console.WriteLine($"Warmup complete for database '{dbPath}'. Inserted 50000 dummy rows to trigger AV scans.");
     }
+
+    static List<CopyJob> LoadPendingCopyJobs(string dbPath, string srcPhase)
+    {
+        List<CopyJob> jobs = new();
+        using var conn = new SqliteConnection($"Data Source={dbPath}");
+        conn.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT fc.src_path, fc.dest_path, h.sha256, h.size_bytes
+            FROM file_copy fc
+            JOIN file_hashes h ON fc.src_path = h.path AND h.phase = $ph
+            WHERE fc.state = 'PENDING'
+        """;
+        cmd.Parameters.AddWithValue("$ph", srcPhase);
+        using var rdr = cmd.ExecuteReader();
+        while (rdr.Read())
+            jobs.Add(new CopyJob(rdr.GetString(0), rdr.GetString(1), rdr.GetString(2), rdr.GetInt64(3)));
+        return jobs;
+    }
+
+    static void RunRobocopyBatches(string dbPath, string srcPhase, int threads, BlockingCollection<object> dbOps, BlockingCollection<VerifyJob> verifyQueue)
+    {
+        while (true)
+        {
+            var planned = LoadPendingCopyJobs(dbPath, srcPhase);
+            if (planned.Count == 0)
+                break;
+
+            var grouped = planned
+                .GroupBy(j => (SrcDir: Path.GetDirectoryName(j.SrcPath)!, DestDir: Path.GetDirectoryName(j.DestPath)!))
+                .ToList();
+
+            bool anyClaimed = false;
+            foreach (var group in grouped)
+            {
+                var chunk = new List<CopyJob>(ROBOCOPY_FILE_BATCH_SIZE);
+                long chunkBytes = 0;
+                foreach (var job in group)
+                {
+                    long nextSize = Math.Max(1, job.SizeBytes);
+                    bool shouldFlushBeforeAdd =
+                        chunk.Count > 0 &&
+                        (chunk.Count >= ROBOCOPY_FILE_BATCH_SIZE || chunkBytes + nextSize > ROBOCOPY_TARGET_BATCH_BYTES);
+
+                    if (shouldFlushBeforeAdd)
+                    {
+                        if (TryRunRobocopyBatch(dbPath, threads, dbOps, verifyQueue, group.Key.SrcDir, group.Key.DestDir, chunk))
+                            anyClaimed = true;
+                        chunk = new List<CopyJob>(ROBOCOPY_FILE_BATCH_SIZE);
+                        chunkBytes = 0;
+                    }
+
+                    chunk.Add(job);
+                    chunkBytes += nextSize;
+                    if (chunk.Count >= ROBOCOPY_FILE_BATCH_SIZE || chunkBytes >= ROBOCOPY_TARGET_BATCH_BYTES)
+                    {
+                        if (TryRunRobocopyBatch(dbPath, threads, dbOps, verifyQueue, group.Key.SrcDir, group.Key.DestDir, chunk))
+                            anyClaimed = true;
+                        chunk = new List<CopyJob>(ROBOCOPY_FILE_BATCH_SIZE);
+                        chunkBytes = 0;
+                    }
+                }
+                if (chunk.Count > 0)
+                {
+                    if (TryRunRobocopyBatch(dbPath, threads, dbOps, verifyQueue, group.Key.SrcDir, group.Key.DestDir, chunk))
+                        anyClaimed = true;
+                }
+            }
+
+            if (!anyClaimed)
+                break;
+        }
+    }
+
+    static bool TryRunRobocopyBatch(string dbPath, int threads, BlockingCollection<object> dbOps, BlockingCollection<VerifyJob> verifyQueue, string srcDirPath, string destDirPath, List<CopyJob> chunk)
+    {
+        if (chunk.Count == 0)
+            return false;
+
+        string batchId = Guid.NewGuid().ToString("N");
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        List<CopyJob> claimed = new();
+
+        using (var conn = new SqliteConnection($"Data Source={dbPath}"))
+        {
+            conn.Open();
+            using var tx = conn.BeginTransaction();
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+
+            foreach (var job in chunk)
+            {
+                cmd.Parameters.Clear();
+                cmd.CommandText = """
+                    UPDATE file_copy
+                    SET state='COPYING', batch_id=$bid, batch_claimed_at=$t, batch_attempt=batch_attempt+1, updated_at=$t
+                    WHERE src_path=$sp AND state='PENDING'
+                """;
+                cmd.Parameters.AddWithValue("$bid", batchId);
+                cmd.Parameters.AddWithValue("$t", now);
+                cmd.Parameters.AddWithValue("$sp", job.SrcPath);
+                int changed = cmd.ExecuteNonQuery();
+                if (changed > 0)
+                    claimed.Add(job);
+            }
+            tx.Commit();
+        }
+
+        if (claimed.Count == 0)
+            return false;
+
+        string sDir = StripExtendedPrefix(srcDirPath);
+        string dDir = StripExtendedPrefix(destDirPath);
+        Directory.CreateDirectory(dDir);
+
+        string fileArgs = string.Join(' ', claimed.Select(j => $"\"{Path.GetFileName(j.SrcPath)}\""));
+        var psi = new ProcessStartInfo
+        {
+            FileName = "robocopy",
+            Arguments = $"\"{sDir}\" \"{dDir}\" {fileArgs} /Z /B /COPYALL /R:1 /W:1 /MT:{threads} /NFL /NDL /NJH /NJS",
+            CreateNoWindow = true,
+            UseShellExecute = false
+        };
+
+        string batchError = "";
+        try
+        {
+            using var proc = Process.Start(psi);
+            if (proc != null)
+            {
+                proc.WaitForExit();
+                if (proc.ExitCode >= 8)
+                    batchError = $"Robocopy exit code {proc.ExitCode}";
+            }
+            else
+            {
+                batchError = "Robocopy process failed to start";
+            }
+        }
+        catch (Exception ex)
+        {
+            batchError = ex.Message;
+        }
+
+        foreach (var job in claimed)
+        {
+            if (File.Exists(job.DestPath))
+            {
+                dbOps.Add(new CopyStateUpdate(job.SrcPath, "COPIED", ""));
+                verifyQueue.Add(new VerifyJob(job.SrcPath, job.DestPath, job.SrcSha256));
+            }
+            else
+            {
+                string err = string.IsNullOrWhiteSpace(batchError)
+                    ? $"Batch {batchId}: destination file missing after robocopy"
+                    : $"Batch {batchId}: {batchError}";
+                dbOps.Add(new CopyStateUpdate(job.SrcPath, "FAILED", err));
+            }
+        }
+
+        return true;
+    }
 }
 
 record FileRow(string Path, string Folder, string Filename, long SizeBytes, string Sha256, string Phase);
 record CopyStateUpdate(string SrcPath, string State, string LastError);
+record CopyVerified(string SrcPath);
 record CopyInsert(string SrcPath, string DestPath);
-record CopyJob(string SrcPath, string DestPath, string SrcSha256);
+record CopyJob(string SrcPath, string DestPath, string SrcSha256, long SizeBytes);
 record VerifyJob(string SrcPath, string DestPath, string SrcSha256);
