@@ -1,48 +1,49 @@
 # FastFileHasher – Usage Guide
 
-FastFileHasher is a **read‑only file integrity tool** used to:
+FastFileHasher is a **hash‑verified file migration engine** used to:
 
 *   scan files and record SHA‑256 hashes
-*   verify files after they have been moved by external systems
+*   copy files deterministically with exact path mapping
+*   migrate files (copy and securely remove source upon verification)
+*   verify files after they have been moved by external systems or by this tool
 *   flag any integrity issues (missing, extra, or mismatched files)
 *   produce CSV outputs for audit or EDRMS use
-
-The tool **never modifies scanned files**.
 
 ***
 
 ## Command syntax
     FastFileHasher warmup <dbPath>
-    FastFileHasher scan   <rootPath> <dbPath> <phase> [threads]
-    FastFileHasher verify <rootPath> <dbPath> <phase> [threads]
-    FastFileHasher export <outputDir> <dbPath> <phase>
+    FastFileHasher scan    <rootPath> <dbPath> <phase> [threads]
+    FastFileHasher verify  <rootPath> <dbPath> <phase> [threads]
+    FastFileHasher export  <outputDir> <dbPath> <phase>
+    FastFileHasher copy    <srcRoot> <destRoot> <dbPath> <srcPhase> <destPhase> [threads] [--use-robocopy] [--in-memory]
+    FastFileHasher migrate <srcRoot> <destRoot> <dbPath> <srcPhase> <destPhase> [threads] [--use-robocopy] [--in-memory]
     
-
 ***
 
 ## Arguments
 
-### `<rootPath>`
+### `<rootPath>` or `<srcRoot>` / `<destRoot>`
 
-The root directory to scan.
+The directory to scan, copy from, or copy to.
 
-*   All files under this path are scanned recursively
-*   Files are opened **read‑only**
-*   Long paths are supported
+*   All files under this path are processed recursively
+*   Long paths are supported (internally normalized to `\\?\` prefix)
 
 Examples:
 
     D:\Records
     X:\ArchiveVolume
+    \\Server\Share\Data
 
 ***
 
 ### `<dbPath>`
 
-Path to the SQLite database used to store scan results.
+Path to the SQLite database used to store scan and copy state.
 
 *   Created automatically if it does not exist
-*   Reused across runs
+*   Reused across runs for resuming
 *   Must be writable
 
 Example:
@@ -60,17 +61,13 @@ Typical values:
 *   `source` – before files are moved
 *   `dest` – after files are moved
 
-The phase is used to compare scans during verification.  
-It is a logical label only and does not affect file access.
-
 ***
 
 ### `[threads]` (optional)
 
-Maximum number of parallel hashing threads.
+Maximum number of parallel hashing and copy threads.
 
-*   Default: number of CPU cores
-*   Typical effective range: **8–16**
+*   Default: dynamically tuned (typically 8 for UNC paths, up to 32 for local)
 *   Increasing beyond storage capability will not improve performance
 
 Example:
@@ -79,7 +76,34 @@ Example:
 
 ***
 
+### `--use-robocopy`
+
+Opts-in to using robocopy to handle file data movement, maintaining full NTFS fidelity (Owner, ACLs, ADS, Dates). If not specified, the system will perform a managed copy (which generates a temporary destination, copies the data, and performs an atomic rename).
+
+***
+
 ## Modes
+
+### `copy`
+
+Streams files from `<srcRoot>` to `<destRoot>`.
+As soon as a file is successfully hashed in the source, it is placed in a queue and copied. Once copied, it is hashed at the destination and cryptographically verified against the source hash.
+
+Example:
+
+    FastFileHasher copy D:\SourceData X:\MovedData D:\hashes.db source dest 16 --use-robocopy
+
+***
+
+### `migrate`
+
+Performs the exact same workflow as `copy`, but **deletes the source file** immediately upon successful cryptographic verification at the destination.
+
+Example:
+
+    FastFileHasher migrate D:\SourceData X:\MovedData D:\hashes.db source dest 16
+
+***
 
 ### `warmup`
 
@@ -97,15 +121,7 @@ Example:
 
 ### `scan`
 
-Performs a read‑only scan of all files under `<rootPath>` and records:
-
-*   relative folder
-*   filename
-*   file size
-*   SHA‑256 hash
-*   phase label
-
-No comparison is performed.
+Performs a read‑only scan of all files under `<rootPath>` and records hashes. No comparison is performed.
 
 Example:
 
@@ -116,36 +132,11 @@ Example:
 ### `verify`
 
 Performs a scan **and immediately verifies** results against an existing source phase.
-
-Verify does the following in one operation:
-
-1.  Scans destination files
-2.  Compares source and destination hashes
-3.  Generates a CSV containing **only problems**
-
-No files are modified or repaired.
+Generates a `verification_issues.csv` if issues are found.
 
 Example:
 
     FastFileHasher verify X:\MovedData D:\hashes.db dest 16
-
-#### Verification CSV output
-
-If issues are found, a file is created next to the database:
-
-    verification_issues.csv
-
-CSV format:
-
-    Path,Status,SourceSHA256,DestSHA256
-
-Possible `Status` values:
-
-*   `MISMATCH` – file exists in both locations but contents differ
-*   `MISSING` – file exists in source but not in destination
-*   `EXTRA` – file exists in destination but not in source
-
-If **no issues are found**, the CSV is automatically deleted and the verify run reports success.
 
 ***
 
@@ -155,49 +146,44 @@ Exports hashes for a given phase as per‑folder CSV files.
 
 *   One CSV per relative folder
 *   Intended for EDRMS or long‑term retention
-*   Does not perform verification
 
 Example:
 
     FastFileHasher export D:\EDRMS_OUTPUT D:\hashes.db source
 
-Output structure:
+***
 
-    EDRMS_OUTPUT\
-      FolderA\
-        folder_hashes.csv
-      FolderB\
-        folder_hashes.csv
+## Verification CSV output
+
+If issues are found during `verify`, `copy`, or `migrate`, a file is created next to the database:
+
+    verification_issues.csv
+
+CSV format:
+
+    Path,Status,SourceSHA256,DestSHA256,LastError
+
+Possible `Status` values:
+
+*   `MISMATCH` – file exists in both locations but contents differ
+*   `MISSING` – file exists in source but not in destination
+*   `EXTRA` – file exists in destination but not in source
+*   `FAILED` – copy or verification process threw an error (check `LastError`)
+
+If **no issues are found**, the CSV is automatically deleted.
 
 ***
 
-## Important behaviour notes
-
-*   The tool is **read‑only by design**
-*   No files are rewritten, repaired, deleted, or moved
-*   Verification detects and flags issues only
-*   Matching is based on **relative folder + filename**
-*   File contents are verified using SHA‑256
-
-***
-
-## Typical workflow
+## Typical workflow for Migration
 
 1.  **Antivirus Warmup (Optional, but recommended on first run)**
         FastFileHasher warmup <dbPath>
 
-2.  **Initial scan (before move)**
-        FastFileHasher scan <sourcePath> <dbPath> source
+2.  **Run Migration (with managed copy)**
+        FastFileHasher migrate <sourcePath> <destPath> <dbPath> source dest
 
-2.  **Files moved externally**  
-    (SAN, replication, storage tooling)
+3.  **Review `verification_issues.csv` if present**
+    (Note: You can re-run the exact same `migrate` command to retry any failures or pick up where it left off after an interruption)
 
-3.  **Verification scan (after move)**
-        FastFileHasher verify <destPath> <dbPath> dest
-
-4.  **Review `verification_issues.csv` if present**
-
-5.  **Export CSVs for EDRMS (optional)**
+4.  **Export CSVs for EDRMS (optional)**
         FastFileHasher export <outputDir> <dbPath> source
-
-
