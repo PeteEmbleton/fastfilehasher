@@ -115,7 +115,7 @@ public class Program
                     var (size, hash) = ComputeSha256AndSize(file);
                     queue.Add(new FileRow(
                         file,
-                        Path.GetRelativePath(root, Path.GetDirectoryName(file)!),
+                        NormalizeFolder(Path.GetRelativePath(root, Path.GetDirectoryName(file)!)),
                         Path.GetFileName(file),
                         size,
                         hash,
@@ -126,7 +126,7 @@ public class Program
                 {
                     queue.Add(new FileRow(
                         file,
-                        Path.GetRelativePath(root, Path.GetDirectoryName(file)!),
+                        NormalizeFolder(Path.GetRelativePath(root, Path.GetDirectoryName(file)!)),
                         Path.GetFileName(file),
                         0,
                         $"ERROR:{ex.GetType().Name}",
@@ -238,7 +238,7 @@ public class Program
                     try
                     {
                         var (size, hash) = ComputeSha256AndSize(file);
-                        string folder = Path.GetRelativePath(srcRoot, Path.GetDirectoryName(file)!);
+                        string folder = NormalizeFolder(Path.GetRelativePath(srcRoot, Path.GetDirectoryName(file)!));
                         string filename = Path.GetFileName(file);
                         dbOps.Add(new FileRow(file, folder, filename, size, hash, srcPhase));
 
@@ -253,7 +253,7 @@ public class Program
                     {
                         dbOps.Add(new FileRow(
                             file,
-                            Path.GetRelativePath(srcRoot, Path.GetDirectoryName(file)!),
+                            NormalizeFolder(Path.GetRelativePath(srcRoot, Path.GetDirectoryName(file)!)),
                             Path.GetFileName(file), 0, $"ERROR:{ex.GetType().Name}", srcPhase));
                     }
                 });
@@ -313,8 +313,7 @@ public class Program
                 try
                 {
                     var (size, destHash) = ComputeSha256AndSize(job.DestPath);
-                    string destFolder = Path.GetRelativePath(destRoot, Path.GetDirectoryName(job.DestPath)!);
-                    if (destFolder == ".") destFolder = "";
+                    string destFolder = NormalizeFolder(Path.GetRelativePath(destRoot, Path.GetDirectoryName(job.DestPath)!));
                     dbOps.Add(new FileRow(job.DestPath, destFolder, Path.GetFileName(job.DestPath), size, destHash, destPhase));
 
                     if (destHash == job.SrcSha256)
@@ -425,8 +424,6 @@ public class Program
             UPDATE file_copy SET state=$st, last_error=$err, updated_at=$t WHERE src_path=$sp
         """;
 
-        var cmdExec = workConn.CreateCommand();
-
         int count = 0;
 
         try
@@ -465,11 +462,6 @@ public class Program
                         cmdUpdateCopy.Parameters.AddWithValue("$sp", cu.SrcPath);
                         cmdUpdateCopy.ExecuteNonQuery();
                     }
-                    else if (msg is SqlExec se)
-                    {
-                        cmdExec.CommandText = se.Sql;
-                        cmdExec.ExecuteNonQuery();
-                    }
 
                     count++;
                     if (count % DEFAULT_BATCH_SIZE == 0)
@@ -480,28 +472,23 @@ public class Program
                         cmdHash.Transaction = tx;
                         cmdInsertCopy.Transaction = tx;
                         cmdUpdateCopy.Transaction = tx;
-                        cmdExec.Transaction = tx;
                     }
                 }
                 else
                 {
                     if (queue.IsCompleted)
-                    {
                         more = false;
-                    }
-                    
-                    if (count > 0 && count % DEFAULT_BATCH_SIZE != 0)
+
+                    if (count > 0)
                     {
-                        // Commit partial batch so readers can see it
+                        // Commit partial batch so readers can see fresh data
                         tx.Commit();
                         tx.Dispose();
                         tx = workConn.BeginTransaction();
                         cmdHash.Transaction = tx;
                         cmdInsertCopy.Transaction = tx;
                         cmdUpdateCopy.Transaction = tx;
-                        cmdExec.Transaction = tx;
-                        // Reset count to avoid re-committing repeatedly on empty queue
-                        count = 0; 
+                        count = 0;
                     }
                 }
             }
@@ -677,6 +664,10 @@ public class Program
         return path;
     }
 
+    // ".", which Path.GetRelativePath returns for the root itself, is normalised to "" so that
+    // folder comparisons between source and dest phases always match.
+    static string NormalizeFolder(string folder) => folder == "." ? "" : folder;
+
     static string Csv(string v)
     {
         return v.Contains(',') || v.Contains('"')
@@ -684,21 +675,29 @@ public class Program
             : v;
     }
 
-    static void RunVerifyReport(string destRoot, string dbPath, string destPhase)
+    static void RunVerifyReport(string destRoot, string dbPath, string destPhase, string? knownSrcPhase = null)
     {
         using var conn = new SqliteConnection($"Data Source={dbPath}");
         conn.Open();
 
-        using var cmdSrc = conn.CreateCommand();
-        cmdSrc.CommandText = "SELECT DISTINCT phase FROM file_hashes WHERE phase != $p LIMIT 1";
-        cmdSrc.Parameters.AddWithValue("$p", destPhase);
-        var srcObj = cmdSrc.ExecuteScalar();
-        if (srcObj == null || srcObj is DBNull)
+        string srcPhase;
+        if (knownSrcPhase != null)
         {
-            Console.WriteLine("No source phase found in DB to compare against.");
-            return;
+            srcPhase = knownSrcPhase;
         }
-        string srcPhase = (string)srcObj;
+        else
+        {
+            using var cmdSrc = conn.CreateCommand();
+            cmdSrc.CommandText = "SELECT DISTINCT phase FROM file_hashes WHERE phase != $p LIMIT 1";
+            cmdSrc.Parameters.AddWithValue("$p", destPhase);
+            var srcObj = cmdSrc.ExecuteScalar();
+            if (srcObj == null || srcObj is DBNull)
+            {
+                Console.WriteLine("No source phase found in DB to compare against.");
+                return;
+            }
+            srcPhase = (string)srcObj;
+        }
 
         string outCsv = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(dbPath)) ?? ".", "verification_issues.csv");
         int issues = 0;
@@ -715,8 +714,11 @@ public class Program
                     d.sha256 AS dst_hash,
                     c.last_error
                 FROM file_hashes s
-                LEFT JOIN file_hashes d ON s.path = d.path AND d.phase = $dst
-                LEFT JOIN file_copy c ON s.path = c.src_path
+                LEFT JOIN file_hashes d
+                    ON  d.folder   = s.folder
+                    AND d.filename = s.filename
+                    AND d.phase    = $dst
+                LEFT JOIN file_copy c ON c.src_path = s.path
                 WHERE s.phase = $src 
                   AND (d.sha256 IS NULL OR s.sha256 != d.sha256 OR c.state = 'FAILED')
 
@@ -728,7 +730,10 @@ public class Program
                     d.sha256 AS dst_hash,
                     NULL AS last_error
                 FROM file_hashes d
-                LEFT JOIN file_hashes s ON s.path = d.path AND s.phase = $src
+                LEFT JOIN file_hashes s
+                    ON  s.folder   = d.folder
+                    AND s.filename = d.filename
+                    AND s.phase    = $src
                 WHERE d.phase = $dst
                   AND s.path IS NULL
             """;
@@ -812,6 +817,5 @@ public class Program
 record FileRow(string Path, string Folder, string Filename, long SizeBytes, string Sha256, string Phase);
 record CopyStateUpdate(string SrcPath, string State, string LastError);
 record CopyInsert(string SrcPath, string DestPath);
-record SqlExec(string Sql);
 record CopyJob(string SrcPath, string DestPath, string SrcSha256);
 record VerifyJob(string SrcPath, string DestPath, string SrcSha256);
